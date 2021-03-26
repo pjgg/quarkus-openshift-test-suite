@@ -14,6 +14,8 @@ import io.quarkus.ts.openshift.common.injection.WithName;
 import io.quarkus.ts.openshift.common.util.AwaitUtil;
 import io.quarkus.ts.openshift.common.util.OpenShiftUtil;
 import io.restassured.RestAssured;
+import org.apache.commons.lang3.tuple.Pair;
+import org.fusesource.jansi.Ansi;
 import org.junit.jupiter.api.extension.AfterAllCallback;
 import org.junit.jupiter.api.extension.BeforeAllCallback;
 import org.junit.jupiter.api.extension.BeforeEachCallback;
@@ -39,10 +41,15 @@ import java.net.MalformedURLException;
 import java.net.URL;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.ServiceLoader;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutionException;
 import java.util.logging.Level;
 import java.util.logging.LogManager;
 import java.util.logging.Logger;
@@ -139,19 +146,19 @@ final class OpenShiftTestExtension implements BeforeAllCallback, AfterAllCallbac
 
     private void doBeforeAll(ExtensionContext context) throws Exception {
         System.out.println("---------- OpenShiftTest set up ----------");
-
         createEphemeralNamespaceIfNecessary(context);
-
-        deployAdditionalResources(context);
-
+        Map<String, String> args = resolveEnvVars(context);
+        List<CompletableFuture<Pair<String, Boolean>>> openshiftSetup = new ArrayList<>();
         runPublicStaticVoidMethods(CustomizeApplicationDeployment.class, context);
-
-        Map<String, String> envVars = resolveEnvVars(context);
-        getDeploymentStrategy(context).deploy(envVars);
-
-        setUpRestAssured(context);
+        openshiftSetup.add(CompletableFuture.completedFuture(Pair.of("createEphemeralNamespace",EphemeralNamespace.isEnabled())));
+        openshiftSetup.add(deployAdditionalResources(context));
+        openshiftSetup.add(deployApplication(args, context));
+        openshiftSetup.add(setUpRestAssured(context));
+        openshiftSetup.add(CompletableFuture.completedFuture(Pair.of("Readiness probe",true)));
+        CompletableFuture.allOf(openshiftSetup.toArray(new CompletableFuture[0])).join();
 
         getAwaitUtil(context).awaitAppRoute();
+        printResults(openshiftSetup);
     }
 
     private Map<String, String> resolveEnvVars(ExtensionContext context) throws OpenShiftTestException {
@@ -180,18 +187,45 @@ final class OpenShiftTestExtension implements BeforeAllCallback, AfterAllCallbac
         }
     }
 
-    private void deployAdditionalResources(ExtensionContext context) throws IOException, InterruptedException {
-        TestsStatus testsStatus = getTestsStatus(context);
-        OpenShiftClient oc = getOpenShiftClient(context);
-        AwaitUtil awaitUtil = getAwaitUtil(context);
-        Optional<AnnotatedElement> element = context.getElement();
-        if (element.isPresent()) {
-            AnnotatedElement annotatedElement = element.get();
-            AdditionalResources[] annotations = annotatedElement.getAnnotationsByType(AdditionalResources.class);
-            for (AdditionalResources additionalResources : annotations) {
-                AdditionalResourcesDeployed deployed = AdditionalResourcesDeployed.deploy(additionalResources,
-                        testsStatus, oc, awaitUtil);
+    private CompletableFuture<Pair<String, Boolean>> deployAdditionalResources(ExtensionContext context) {
+        return CompletableFuture.supplyAsync(()-> {
+            System.out.println("ECO 1:  deployAdditionalResources");
+            TestsStatus testsStatus = getTestsStatus(context);
+            OpenShiftClient oc = getOpenShiftClient(context);
+            AwaitUtil awaitUtil = getAwaitUtil(context);
+            Optional<AnnotatedElement> element = context.getElement();
+            if (element.isPresent()) {
+                List<CompletableFuture<Pair<String, Boolean>>> additionalResourceStatus = new ArrayList<>();
+                AnnotatedElement annotatedElement = element.get();
+                AdditionalResources[] annotations = annotatedElement.getAnnotationsByType(AdditionalResources.class);
+                for (AdditionalResources additionalResources : annotations) {
+                    additionalResourceStatus.add(deployAdditionalResource(context, testsStatus, oc, awaitUtil, additionalResources));
+                }
+                CompletableFuture.allOf(additionalResourceStatus.toArray(new CompletableFuture[0])).join();
+                printResults(additionalResourceStatus);
+            }
+            return Pair.of("deployAdditionalResources", element.isPresent());
+        });
+    }
 
+    private void printResults(List<CompletableFuture<Pair<String, Boolean>>> results) {
+        System.out.println(ansi().a("--- Summary ---"));
+        for(CompletableFuture<Pair<String, Boolean>> result: results){
+            try {
+                Ansi content = ansi().a(result.get().getKey() + " ");
+                content = result.get().getValue()?content.fgGreen().a("\u2713"):content.fgRed().a("\u2717");
+                System.out.println(content.reset());
+            } catch (InterruptedException | ExecutionException e) {
+                System.err.println(e.getMessage());
+            }
+        }
+        System.out.println(ansi().a("--- end ---"));
+    }
+
+    private CompletableFuture<Pair<String, Boolean>> deployAdditionalResource(ExtensionContext context, TestsStatus testsStatus, OpenShiftClient oc, AwaitUtil awaitUtil, AdditionalResources additionalResources) {
+        return CompletableFuture.supplyAsync(()-> {
+            try {
+                AdditionalResourcesDeployed deployed = AdditionalResourcesDeployed.deploy(additionalResources, testsStatus, oc, awaitUtil);
                 if (EphemeralNamespace.isDisabled()) {
                     // when using ephemeral namespaces, we don't delete additional resources because:
                     // - when an ephemeral namespace is dropped, everything is destroyed anyway
@@ -199,11 +233,15 @@ final class OpenShiftTestExtension implements BeforeAllCallback, AfterAllCallbac
                     //   everything in the ephemeral namespace must be kept intact
                     getStore(context).put(new Object(), deployed);
                 }
+                return Pair.of(additionalResources.value(), true);
+            } catch (IOException | InterruptedException e) {
+                e.printStackTrace();
+                return Pair.of(additionalResources.value(), false);
             }
-        }
+        });
     }
 
-    private void setUpRestAssured(ExtensionContext context) throws Exception {
+    private CompletableFuture<Pair<String, Boolean>> setUpRestAssured(ExtensionContext context) throws Exception {
         OpenShiftClient oc = getOpenShiftClient(context);
         AppMetadata metadata = getAppMetadata(context);
 
@@ -231,6 +269,7 @@ final class OpenShiftTestExtension implements BeforeAllCallback, AfterAllCallbac
             RestAssured.baseURI = knRoute.getStatus().getUrl();
         }
         RestAssured.basePath = metadata.httpRoot;
+        return CompletableFuture.completedFuture(Pair.of("restAssuredSetup",true));
     }
 
     @Override
@@ -274,8 +313,9 @@ final class OpenShiftTestExtension implements BeforeAllCallback, AfterAllCallbac
         }
     }
 
-    private void runPublicStaticVoidMethods(Class<? extends Annotation> annotation, ExtensionContext context) throws Exception {
-        for (Method method : context.getRequiredTestClass().getMethods()) {
+    private boolean runPublicStaticVoidMethods(Class<? extends Annotation> annotation, ExtensionContext context) throws Exception {
+        Method[] methods = context.getRequiredTestClass().getMethods();
+        for (Method method : methods) {
             if (method.getAnnotation(annotation) != null) {
                 if (!isPublicStaticVoid(method)) {
                     throw new OpenShiftTestException("@" + annotation.getSimpleName()
@@ -294,6 +334,8 @@ final class OpenShiftTestExtension implements BeforeAllCallback, AfterAllCallbac
                 method.invoke(null, arguments);
             }
         }
+
+        return methods.length > 0;
     }
 
     private static boolean isPublicStaticVoid(Method method) {
@@ -422,6 +464,20 @@ final class OpenShiftTestExtension implements BeforeAllCallback, AfterAllCallbac
         } catch (Exception ex) {
             System.out.println(ansi().a("Error running post failure action. Caused by: " + ex).reset());
         }
+    }
+
+    private CompletableFuture<Pair<String, Boolean>> deployApplication(Map<String, String> envVars, ExtensionContext context) {
+        return CompletableFuture.supplyAsync(()-> {
+            System.out.println("ECO deployApplication");
+            try {
+                getDeploymentStrategy(context).deploy(envVars);
+                System.out.println("ECO-end deployApplication");
+                return Pair.of("deployApplicationCompleted", true);
+            } catch (Exception e) {
+                System.err.println(e.getMessage());
+                throw new CompletionException(e);
+            }
+        });
     }
 
     private DeploymentStrategy getDeploymentStrategy(ExtensionContext context) throws Exception {
